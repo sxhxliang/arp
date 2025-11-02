@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
     // Build router and wrap in Arc to avoid repeated cloning
     let router = Arc::new(routes::build_router(state));
 
-    loop {
+    'main_loop: loop {
         match run_client_loop(config_arc.clone(), router.clone()).await {
             Ok(_) => break,
             Err(e) if config_arc.auto_reconnect => {
@@ -93,10 +93,17 @@ async fn main() -> Result<()> {
                     "Connection error: {}. Reconnecting in {}s...",
                     e, config_arc.reconnect_interval
                 );
-                tokio::time::sleep(tokio::time::Duration::from_secs(
+                let sleep = tokio::time::sleep(tokio::time::Duration::from_secs(
                     config_arc.reconnect_interval,
-                ))
-                .await;
+                ));
+                tokio::pin!(sleep);
+                tokio::select! {
+                    _ = &mut sleep => {},
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Received Ctrl+C signal. Shutting down before reconnect...");
+                        break 'main_loop;
+                    }
+                }
             }
             Err(e) => return Err(e),
         }

@@ -54,6 +54,34 @@ fn generate_id() -> String {
     format!("{:x}", id)
 }
 
+fn drain_client_resources(info: &Arc<ClientInfo>) {
+    while info.pool.pop().is_some() {}
+}
+
+fn remove_client(active_clients: &ActiveClients, client_id: &str) -> bool {
+    if let Some((_, info)) = active_clients.remove(client_id) {
+        drain_client_resources(&info);
+        true
+    } else {
+        false
+    }
+}
+
+fn remove_client_if_current(
+    active_clients: &ActiveClients,
+    client_id: &str,
+    expected: &Arc<ClientInfo>,
+) -> bool {
+    if let Some((_, info)) =
+        active_clients.remove_if(client_id, |_, current| Arc::ptr_eq(current, expected))
+    {
+        drain_client_resources(&info);
+        true
+    } else {
+        false
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -162,66 +190,77 @@ async fn handle_control_connections(
 async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
-    let client_id = if let Command::Register { client_id: id } = read_command(&mut reader).await? {
-        info!("Registration attempt for client_id: {}", id);
+    let (client_id, client_info) =
+        if let Command::Register { client_id: id } = read_command(&mut reader).await? {
+            info!("Registration attempt for client_id: {}", id);
 
-        // Remove old registration if exists (allow reconnection)
-        if let Some((_, old_info)) = active_clients.remove(&id) {
-            warn!(
-                "Client ID {} was already registered, replacing with new connection.",
-                id
-            );
-            // Clear old pool connections
-            while old_info.pool.pop().is_some() {}
-        }
+            // Remove old registration if exists (allow reconnection)
+            if remove_client(&active_clients, &id) {
+                warn!(
+                    "Client ID {} was already registered, replacing with new connection.",
+                    id
+                );
+            }
 
-        // Create channel for sending commands
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            // Create channel for sending commands
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-        active_clients.insert(
-            id.clone(),
-            Arc::new(ClientInfo {
+            let client_info = Arc::new(ClientInfo {
                 cmd_tx,
                 pool: Arc::new(SegQueue::new()),
-            }),
-        );
+            });
 
-        // Send registration success
-        write_command(
-            &mut writer,
-            &Command::RegisterResult {
-                success: true,
-                error: None,
-            },
-        )
-        .await?;
-        info!("Client {} registered successfully.", id);
+            active_clients.insert(id.clone(), Arc::clone(&client_info));
 
-        // Spawn task to handle command sending
-        let client_id_clone = id.clone();
-        tokio::spawn(async move {
-            while let Some(cmd) = cmd_rx.recv().await {
-                if write_command(&mut writer, &cmd).await.is_err() {
-                    error!("Failed to send command to client {}", client_id_clone);
-                    break;
+            // Send registration success
+            write_command(
+                &mut writer,
+                &Command::RegisterResult {
+                    success: true,
+                    error: None,
+                },
+            )
+            .await?;
+            info!("Client {} registered successfully.", id);
+
+            // Spawn task to handle command sending
+            let client_id_clone = id.clone();
+            let active_clients_for_writer = active_clients.clone();
+            let client_info_for_writer = Arc::clone(&client_info);
+            tokio::spawn(async move {
+                while let Some(cmd) = cmd_rx.recv().await {
+                    if let Err(e) = write_command(&mut writer, &cmd).await {
+                        error!(
+                            "Failed to send command to client {}: {}",
+                            client_id_clone, e
+                        );
+                        if remove_client_if_current(
+                            &active_clients_for_writer,
+                            &client_id_clone,
+                            &client_info_for_writer,
+                        ) {
+                            warn!(
+                                "Removed client {} after write failure on control channel.",
+                                client_id_clone
+                            );
+                        }
+                        break;
+                    }
                 }
-            }
-        });
+            });
 
-        id
-    } else {
-        return Err(anyhow!("First command was not Register"));
-    };
+            (id, client_info)
+        } else {
+            return Err(anyhow!("First command was not Register"));
+        };
+    let client_info_for_reader = Arc::clone(&client_info);
 
     // Keep reading from the control channel, but we don't expect more commands.
     // The main purpose is to detect when the client disconnects.
     loop {
         if reader.read_u8().await.is_err() {
             warn!("Client {} disconnected.", client_id);
-            if let Some((_, old_info)) = active_clients.remove(&client_id) {
-                // Clear pool connections when client disconnects
-                while old_info.pool.pop().is_some() {}
-            }
+            remove_client_if_current(&active_clients, &client_id, &client_info_for_reader);
             break;
         }
     }
@@ -379,7 +418,7 @@ async fn route_public_connection(
         .as_ref()
         .and_then(|req| req.query_param("token"))
     {
-        Some(t) => t,
+        Some(t) => t.clone(),
         None => {
             if http_request.is_some() {
                 let _ = HttpResponse::not_found()
@@ -391,7 +430,11 @@ async fn route_public_connection(
         }
     };
 
-    let token = token_raw.split_whitespace().next().unwrap_or("");
+    let token = token_raw
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
 
     if token.is_empty() {
         if http_request.is_some() {
@@ -405,8 +448,8 @@ async fn route_public_connection(
 
     // Token-based routing
 
-    let client_info = match active_clients.get(token) {
-        Some(info) => info,
+    let client_info = match active_clients.get(token.as_str()) {
+        Some(info) => Arc::clone(info.value()),
         None => {
             warn!("Client '{}' not found for token", token);
             if http_request.is_some() {
@@ -422,9 +465,9 @@ async fn route_public_connection(
     // Phase 2: Try to get connection from pool first (fast path)
     if let Some(mut proxy_stream) = client_info.pool.pop() {
         // If we parsed HTTP, we need to reconstruct and send the request
-        if let Some(request) = http_request {
+        if let Some(request) = http_request.as_ref() {
             // Write reconstructed HTTP request to proxy stream
-            if let Err(e) = write_http_request(&mut proxy_stream, &request).await {
+            if let Err(e) = write_http_request(&mut proxy_stream, request).await {
                 error!("Failed to write HTTP request to proxy stream: {}", e);
                 return Err(e);
             }
@@ -455,6 +498,7 @@ async fn route_public_connection(
     // Send command to client via channel
     if client_info.cmd_tx.send(command).is_err() {
         pending_connections.remove(&proxy_conn_id);
+        remove_client_if_current(&active_clients, token.as_str(), &client_info);
         return Err(anyhow!("Client channel closed"));
     }
 
@@ -502,7 +546,9 @@ async fn maintain_connection_pools(
     // Prewarm pools immediately on first run
     if prewarm {
         for entry in active_clients.iter() {
-            let (client_id, client_info) = entry.pair();
+            let client_id = entry.key().clone();
+            let client_info = Arc::clone(entry.value());
+            drop(entry);
             info!(
                 "Prewarming pool for client {} with {} connections",
                 client_id, target_pool_size
@@ -526,7 +572,10 @@ async fn maintain_connection_pools(
         ticker.tick().await;
 
         for entry in active_clients.iter() {
-            let (client_id, client_info) = entry.pair();
+            let client_id = entry.key().clone();
+            let client_info = Arc::clone(entry.value());
+            drop(entry);
+
             let current_size = client_info.pool.len();
 
             if current_size < target_pool_size {
@@ -544,6 +593,7 @@ async fn maintain_connection_pools(
                             "Failed to request pool connection for {}: channel closed",
                             client_id
                         );
+                        remove_client_if_current(&active_clients, &client_id, &client_info);
                         break;
                     }
                 }

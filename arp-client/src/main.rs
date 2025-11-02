@@ -138,7 +138,7 @@ async fn run_client_loop(config: Arc<ClientConfig>, router: Arc<Router>) -> Resu
 
     if config.server_addr != "proxy.agentx.plus" {
         info!(
-            "🌐 Public URL: {}:17003?token={}",
+            "🌐 Public API URL: http://{}:17003?token={}",
             config.server_addr, config.client_id
         );
     } else {

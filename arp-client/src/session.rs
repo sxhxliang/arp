@@ -1,17 +1,15 @@
-use crate::config::{AgentConfig, ACPConfig};
-use crate::handlers::{strip_content_length_header, HandlerState};
+use crate::config::{ACPConfig, AgentConfig};
+use crate::handlers::{HandlerState, strip_content_length_header};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::task::JoinHandle;
 
-use tokio::sync::{Mutex, RwLock, broadcast};
-
-
+use tokio::sync::{Mutex, broadcast};
 
 /// Executor type for command execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,7 +17,6 @@ pub enum ExecutorKind {
     ACPAgent,
     Command,
 }
-
 
 /// Represents a single agent session
 pub struct Session {
@@ -62,7 +59,10 @@ impl SessionManager {
         state: Arc<HandlerState>,
         session_manager: Arc<Mutex<SessionManager>>,
     ) -> Result<String, String> {
-        let agent_config = self.config.agent_servers.get(agent_name)
+        let agent_config = self
+            .config
+            .agent_servers
+            .get(agent_name)
             .ok_or_else(|| format!("Agent '{}' not found in configuration", agent_name))?
             .clone();
 
@@ -86,23 +86,33 @@ impl SessionManager {
             cmd.env(key, value);
         }
 
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("Failed to spawn child process: {}", e))?;
 
-        let stdin = child.stdin.take()
+        let stdin = child
+            .stdin
+            .take()
             .ok_or_else(|| "Failed to open stdin".to_string())?;
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| "Failed to open stdout".to_string())?;
-        let stderr = child.stderr.take()
+        let stderr = child
+            .stderr
+            .take()
             .ok_or_else(|| "Failed to open stderr".to_string())?;
 
         let stdout_reader = BufReader::new(stdout);
         let stderr_reader = BufReader::new(stderr);
 
-        let temp_session_id = format!("temp-{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis());
+        let temp_session_id = format!(
+            "temp-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
 
         let real_session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let (output_tx, _output_rx) = broadcast::channel::<String>(1000);
@@ -119,17 +129,18 @@ impl SessionManager {
                 while let Ok(Some(line)) = lines.next_line().await {
                     let mut content = strip_content_length_header(&line);
 
-                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                        if let Some(result) = json.get("result") {
-                            if let Some(session_id) = result.get("sessionId").and_then(|s| s.as_str()) {
-                                state.log(&format!("Received sessionId from child: {}", session_id));
+                    if let Ok(json) = serde_json::from_str::<Value>(&content)
+                        && let Some(result) = json.get("result")
+                        && let Some(session_id) = result.get("sessionId").and_then(|s| s.as_str())
+                    {
+                        state.log(&format!("Received sessionId from child: {}", session_id));
 
-                                let mut manager = session_manager.lock().await;
-                                manager.update_session_id(&temp_session_id, session_id).await;
+                        let mut manager = session_manager.lock().await;
+                        manager
+                            .update_session_id(&temp_session_id, session_id)
+                            .await;
 
-                                *real_session_id.lock().await = Some(session_id.to_string());
-                            }
-                        }
+                        *real_session_id.lock().await = Some(session_id.to_string());
                     }
 
                     if let Some(session_id) = real_session_id.lock().await.as_ref() {
@@ -186,17 +197,24 @@ impl SessionManager {
     }
 
     pub fn list_sessions(&self) -> Vec<serde_json::Value> {
-        self.sessions.values().map(|s| {
-            let updated = s.updated_at.try_lock().map(|u| u.clone()).unwrap_or_else(|_| s.created_at.clone());
-            serde_json::json!({
-                "sessionId": s.session_id,
-                "createdAt": s.created_at,
-                "updatedAt": updated,
-                "cwd": s.cwd,
-                "title": s.title,
-                "_meta": {"agentName": s.agent_name}
+        self.sessions
+            .values()
+            .map(|s| {
+                let updated = s
+                    .updated_at
+                    .try_lock()
+                    .map(|u| u.clone())
+                    .unwrap_or_else(|_| s.created_at.clone());
+                serde_json::json!({
+                    "sessionId": s.session_id,
+                    "createdAt": s.created_at,
+                    "updatedAt": updated,
+                    "cwd": s.cwd,
+                    "title": s.title,
+                    "_meta": {"agentName": s.agent_name}
+                })
             })
-        }).collect()
+            .collect()
     }
 
     pub fn get_session_stdin(&mut self, session_id: &str) -> Option<&mut ChildStdin> {
@@ -204,7 +222,9 @@ impl SessionManager {
     }
 
     pub fn subscribe_to_session(&self, session_id: &str) -> Option<broadcast::Receiver<String>> {
-        self.sessions.get(session_id).map(|s| s.output_tx.subscribe())
+        self.sessions
+            .get(session_id)
+            .map(|s| s.output_tx.subscribe())
     }
 
     pub async fn close_session(&mut self, session_id: &str, state: Arc<HandlerState>) {
@@ -216,7 +236,11 @@ impl SessionManager {
             let _ = tokio::time::timeout(timeout, session.stderr_task).await;
             let _ = session.child.kill().await;
             match session.child.wait().await {
-                Ok(status) => state.log(&format!("Session {} exited with code {:?}", session_id, status.code())),
+                Ok(status) => state.log(&format!(
+                    "Session {} exited with code {:?}",
+                    session_id,
+                    status.code()
+                )),
                 Err(e) => state.log_error(&format!("Failed to wait for child process: {}", e)),
             }
         }
@@ -224,7 +248,9 @@ impl SessionManager {
 
     /// List all configured agents
     pub fn list_agents(&self) -> Vec<(String, AgentConfig)> {
-        self.config.agent_servers.iter()
+        self.config
+            .agent_servers
+            .iter()
             .map(|(name, config)| (name.clone(), config.clone()))
             .collect()
     }
@@ -263,7 +289,9 @@ impl SessionManager {
 
     /// Save configuration to file
     pub fn save_config(&self, path: &PathBuf) -> Result<(), String> {
-        self.config.save(path).map_err(|e| format!("Failed to save config: {}", e))
+        self.config
+            .save(path)
+            .map_err(|e| format!("Failed to save config: {}", e))
     }
 }
 
@@ -276,10 +304,10 @@ fn add_session_id_to_message(message: &str, session_id: &str) -> String {
 
     if let Some(obj) = json["result"].as_object_mut() {
         obj.entry("_meta").or_insert(meta);
-    } else if let Some(obj) = json["params"].as_object_mut() {
-        if obj.contains_key("sessionId") {
-            obj.entry("_meta").or_insert(meta);
-        }
+    } else if let Some(obj) = json["params"].as_object_mut()
+        && obj.contains_key("sessionId")
+    {
+        obj.entry("_meta").or_insert(meta);
     }
 
     serde_json::to_string(&json).unwrap_or_else(|_| message.to_string())

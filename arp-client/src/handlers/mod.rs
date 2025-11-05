@@ -4,11 +4,11 @@ pub mod session;
 
 use crate::config::ClientConfig;
 use crate::session::SessionManager;
-use std::sync::Arc;
 use colored::Colorize;
 use serde_json::Value;
-use tokio::sync::Mutex;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Shared state for handlers
 #[derive(Clone)]
@@ -24,7 +24,9 @@ pub struct HandlerState {
 
 impl HandlerState {
     pub fn new(config: ClientConfig) -> Self {
-        let session_manager = Arc::new(Mutex::new(SessionManager::new(config.acp_config.clone().unwrap())));
+        let session_manager = Arc::new(Mutex::new(SessionManager::new(
+            config.acp_config.clone().unwrap(),
+        )));
 
         HandlerState {
             config: Arc::new(config),
@@ -60,7 +62,13 @@ impl HandlerState {
         };
 
         if self.verbose {
-            println!("\n{}\n{} | {} {} bytes", "═".repeat(80).bright_black(), dir, message.len().to_string().bright_magenta(), "⏰".bright_yellow());
+            println!(
+                "\n{}\n{} | {} {} bytes",
+                "═".repeat(80).bright_black(),
+                dir,
+                message.len().to_string().bright_magenta(),
+                "⏰".bright_yellow()
+            );
         } else {
             println!("{}", dir);
         }
@@ -68,14 +76,22 @@ impl HandlerState {
         if self.raw {
             println!("{}", message);
         } else if let Ok(json) = serde_json::from_str::<Value>(message) {
-            println!("{}", serde_json::to_string_pretty(&json).unwrap_or_else(|_| message.to_string()));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json).unwrap_or_else(|_| message.to_string())
+            );
         } else {
             println!("{}", message);
         }
 
         if self.verbose {
             if !self.raw {
-                println!("{}\n{} {}", "─".repeat(80).bright_black(), "📝 Raw:".bright_blue(), message.dimmed());
+                println!(
+                    "{}\n{} {}",
+                    "─".repeat(80).bright_black(),
+                    "📝 Raw:".bright_blue(),
+                    message.dimmed()
+                );
             }
             println!("{}", "═".repeat(80).bright_black());
         }
@@ -83,11 +99,10 @@ impl HandlerState {
 }
 
 pub fn strip_content_length_header(message: &str) -> String {
-    if let Some(pos) = message.find("\n\n") {
-        if message[..pos].starts_with("Content-Length:") {
-            return message[pos + 2..].to_string();
-        }
+    if let Some(pos) = message.find("\n\n")
+        && message[..pos].starts_with("Content-Length:")
+    {
+        return message[pos + 2..].to_string();
     }
     message.to_string()
 }
-

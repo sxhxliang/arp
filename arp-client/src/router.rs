@@ -34,9 +34,10 @@ impl Route {
     fn matches(&self, method: &HttpMethod, path: &str) -> Option<HashMap<String, String>> {
         // Check method
         if let Some(ref route_method) = self.method
-            && route_method != method {
-                return None;
-            }
+            && route_method != method
+        {
+            return None;
+        }
 
         // Simple path matching (exact match or wildcard)
         if self.path_pattern == path {

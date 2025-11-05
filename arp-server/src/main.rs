@@ -293,11 +293,11 @@ async fn handle_proxy_connections(
                     let http_request = pending_conn.http_request;
                     tokio::spawn(async move {
                         // If there's a parsed HTTP request, reconstruct it first
-                        if let Some(request) = http_request {
-                            if let Err(e) = write_http_request(&mut proxy_stream, &request).await {
-                                error!("Failed to write HTTP request to proxy stream: {}", e);
-                                return;
-                            }
+                        if let Some(request) = http_request
+                            && let Err(e) = write_http_request(&mut proxy_stream, &request).await
+                        {
+                            error!("Failed to write HTTP request to proxy stream: {}", e);
+                            return;
                         }
 
                         // Now join the streams

@@ -7,7 +7,8 @@ pub fn extract_agent_name(params: &Value) -> Option<&str> {
 
 /// Extract sessionId from params (supports both _meta.sessionId and sessionId)
 pub fn extract_session_id(params: &Value) -> Option<&str> {
-    params.get("_meta")
+    params
+        .get("_meta")
         .and_then(|m| m.get("sessionId"))
         .and_then(|s| s.as_str())
         .or_else(|| params.get("sessionId")?.as_str())

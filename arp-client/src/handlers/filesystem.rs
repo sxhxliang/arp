@@ -167,10 +167,7 @@ pub async fn handle_filesystem(ctx: HandlerContext, state: HandlerState) -> Resu
         Err(e) if e.kind() == ErrorKind::NotFound => {
             let _ = json_error(
                 404,
-                format!(
-                    "Path not found: {}",
-                    decoded_path.trim_start_matches('/')
-                ),
+                format!("Path not found: {}", decoded_path.trim_start_matches('/')),
             )
             .send(&mut stream)
             .await;
@@ -324,7 +321,8 @@ async fn list_directory(base: &Path, target: &Path) -> Result<Vec<serde_json::Va
 
         let modified = metadata
             .modified()
-            .ok().map(|ts| DateTime::<Utc>::from(ts).to_rfc3339());
+            .ok()
+            .map(|ts| DateTime::<Utc>::from(ts).to_rfc3339());
 
         result.push(json!({
             "name": file_name,

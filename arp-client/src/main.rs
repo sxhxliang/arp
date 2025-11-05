@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -64,11 +64,10 @@ async fn main() -> Result<()> {
 
     config.acp_config = Some(acp_config.clone());
 
-
     let session_manager = Arc::new(Mutex::new(SessionManager::new(acp_config.clone())));
     // let (global_broadcast_tx, _global_broadcast_rx) = broadcast::channel::<String>(1000);
 
-        // Create shared state
+    // Create shared state
     // let state = HandlerState::new(config.clone());
     let state = HandlerState {
         config: Arc::new(config.clone()),

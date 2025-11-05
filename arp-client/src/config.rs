@@ -1,9 +1,9 @@
 use clap::Parser;
-use std::{env, fs};
-use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::{env, fs};
+use uuid::Uuid;
 
 /// Configuration for the arpc client
 #[derive(Parser, Debug, Clone)]
@@ -84,7 +84,7 @@ pub struct ClientConfig {
     /// Show raw data without JSON pretty-printing
     #[arg(long, default_value = "false")]
     pub raw: bool,
-    
+
     /// ACP configuration
     #[clap(skip)]
     pub acp_config: Option<ACPConfig>,
@@ -161,9 +161,11 @@ impl ClientConfig {
 
         // Validate command_path exists if provided
         if let Some(ref cmd_path) = self.command_path
-            && !cmd_path.trim().is_empty() && !std::path::Path::new(cmd_path).exists() {
-                return Err(format!("command_path does not exist: {}", cmd_path));
-            }
+            && !cmd_path.trim().is_empty()
+            && !std::path::Path::new(cmd_path).exists()
+        {
+            return Err(format!("command_path does not exist: {}", cmd_path));
+        }
 
         // Validate MCP port is different from control and proxy ports
         if self.enable_mcp {
@@ -210,9 +212,10 @@ impl ClientConfig {
         }
 
         if let Ok(user) = env::var("USER").or_else(|_| env::var("USERNAME"))
-            && !user.is_empty() {
-                parts.push(format!("user:{user}"));
-            }
+            && !user.is_empty()
+        {
+            parts.push(format!("user:{user}"));
+        }
 
         parts.push(format!("os:{}", env::consts::OS));
         parts.push(format!("arch:{}", env::consts::ARCH));
@@ -220,9 +223,10 @@ impl ClientConfig {
         #[cfg(target_os = "windows")]
         {
             if let Ok(name) = env::var("COMPUTERNAME")
-                && !name.is_empty() {
-                    parts.push(format!("computer:{name}"));
-                }
+                && !name.is_empty()
+            {
+                parts.push(format!("computer:{name}"));
+            }
         }
 
         #[cfg(target_os = "linux")]
@@ -292,8 +296,6 @@ impl ClientConfig {
         }
     }
 }
-
-
 
 /// Configuration for an agent server
 #[derive(Debug, Clone, Serialize, Deserialize)]

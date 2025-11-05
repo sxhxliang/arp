@@ -1,3 +1,4 @@
+mod agentx;
 mod config;
 mod handlers;
 mod jsonrpc;

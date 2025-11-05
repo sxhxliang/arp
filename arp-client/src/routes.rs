@@ -11,7 +11,16 @@ pub fn build_router(state: HandlerState) -> Router {
 }
 
 fn register_session_routes(router_builder: &mut RouterBuilder, state: &HandlerState) {
-    // GET /api/sessions/{session_id} - Get session details or reconnect to active session
+    // GET /api/working-directories - Get all working directories from all agents
+    router_builder.get("/api/working-directories", {
+        let state = state.clone();
+        move |ctx| {
+            let state = state.clone();
+            async move { handlers::session::handle_working_directories(ctx, state).await }
+        }
+    });
+
+    // GET /api/agents - List all agents
     router_builder.get("/api/agents", {
         let state = state.clone();
         move |ctx| {

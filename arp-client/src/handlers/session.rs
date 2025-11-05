@@ -1,3 +1,4 @@
+use crate::agentx;
 use crate::config::AgentConfig;
 use crate::handlers::HandlerState;
 use crate::jsonrpc;
@@ -349,4 +350,31 @@ async fn handle_session_prompt_sse(
     }
 
     Ok(HttpResponse::ok())
+}
+
+/// Handle GET /api/working-directories - Get all working directories from all agents
+pub async fn handle_working_directories(
+    ctx: HandlerContext,
+    state: HandlerState,
+) -> Result<HttpResponse> {
+    state.log("Getting all working directories from all agents");
+
+    match agentx::get_all_working_directories().await {
+        Ok(directories) => {
+            let response = json!({
+                "success": true,
+                "data": directories,
+                "count": directories.len()
+            });
+            send_json_response(ctx.stream, &response).await
+        }
+        Err(e) => {
+            state.log_error(&format!("Failed to get working directories: {}", e));
+            let error = json!({
+                "success": false,
+                "error": e
+            });
+            send_json_response(ctx.stream, &error).await
+        }
+    }
 }

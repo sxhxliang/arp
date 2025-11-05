@@ -20,6 +20,27 @@ fn register_session_routes(router_builder: &mut RouterBuilder, state: &HandlerSt
             async move { handlers::session::handle_agents(ctx, state).await }
         }
     });
+    router_builder.get("/api/agents/{name}", {
+        let state = state.clone();
+        move |ctx| {
+            let state = state.clone();
+            async move { handlers::session::handle_agents(ctx, state).await }
+        }
+    });
+    router_builder.post("/api/agents/{name}", {
+        let state = state.clone();
+        move |ctx| {
+            let state = state.clone();
+            async move { handlers::session::handle_agents(ctx, state).await }
+        }
+    });
+    router_builder.delete("/api/agents/{name}", {
+        let state = state.clone();
+        move |ctx| {
+            let state = state.clone();
+            async move { handlers::session::handle_agents(ctx, state).await }
+        }
+    });
     // POST /acp/session/message - Create new command execution session
     router_builder.post("/acp/session/message", {
         println!("POST /acp/session/message");

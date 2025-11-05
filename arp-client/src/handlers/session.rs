@@ -3,7 +3,6 @@ use crate::handlers::HandlerState;
 use crate::router::HandlerContext;
 use anyhow::Result;
 use common::http::HttpResponse;
-use http::response;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
@@ -54,14 +53,28 @@ pub async fn handle_session(ctx: HandlerContext, state: HandlerState) -> Result<
 
     match method {
         "session/new" => {
-            println!("session/new");
             handle_session_new(ctx, state, json, id).await
         }
-        "initialize" => {
-           todo!()
+        "initialize" |  "session/set_mode" | "session/set_model" | "session/cancel" => {
+            handle_session_single_message(ctx, state, json, id).await
         }
         "session/prompt" => {
-           todo!()
+            handle_session_prompt_sse(ctx, state, json, id).await
+        }
+        "session/list" => {
+            state.log("Received session/list request");
+
+            let sessions = state.session_manager.lock().await.list_sessions();
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "sessions": sessions }
+            });
+
+            state.pretty_print_message("[Server → Client]", &serde_json::to_string(&response).unwrap());
+            let mut stream = ctx.stream;
+            let _ = HttpResponse::ok().json(&response).send(&mut stream).await;
+            return  Ok(HttpResponse::ok())
         }
         _ => {
             let response = serde_json::json!({
@@ -97,6 +110,111 @@ async fn handle_sse_session_example(ctx: HandlerContext, state: HandlerState) ->
     stream.flush().await?;
 
     Ok(HttpResponse::ok())
+}
+
+async fn handle_session_single_message(ctx: HandlerContext, state: HandlerState, json: Value, id: Option<Value>) -> Result<HttpResponse> {
+    let params = match json.get("params") {
+        Some(p) => p,
+        None => {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32602, "message": "Invalid params"}
+            });
+
+            let mut stream = ctx.stream;
+            let _ = HttpResponse::ok().json(&response).send(&mut stream).await;
+            return  Ok(HttpResponse::ok())
+        }
+        
+    };
+    let session_id = match params.get("_meta").and_then(|m| m.get("sessionId")).and_then(|a| a.as_str()) {
+        Some(session_id) => session_id,
+        None => {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32602, "message": "Missing _meta.sessionId"}
+            });
+
+            let mut stream = ctx.stream;
+            let _ = HttpResponse::ok().json(&response).send(&mut stream).await;
+            return  Ok(HttpResponse::ok())
+        }
+    };
+
+    let session_manager = state.session_manager.clone();
+    let mut manager = session_manager.lock().await;
+
+
+    let Some(stdin) = manager.get_session_stdin(&session_id) else {
+        let error_resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32603, "message": "Failed to get session stdin"}
+        });
+        let mut stream = ctx.stream;
+        let _ = HttpResponse::ok().json(&error_resp).send(&mut stream).await;
+        return  Ok(HttpResponse::ok())
+    };
+
+    let request_str = format!("{}\n", json.to_string());
+
+    if let Err(e) = stdin.write_all(request_str.as_bytes()).await {
+        let error_resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32603, "message": format!("Failed to communicate with agent: {}", e)}
+        });
+        let mut stream = ctx.stream;
+        let _ = HttpResponse::ok().json(&error_resp).send(&mut stream).await;
+        return  Ok(HttpResponse::ok())
+    }
+    let _ = stdin.flush().await;
+
+    let Some(mut receiver) = manager.subscribe_to_session(&session_id) else {
+        let error_resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32603, "message": "Failed to subscribe to session"}
+        });
+        let mut stream = ctx.stream;
+        let _ = HttpResponse::ok().json(&error_resp).send(&mut stream).await;
+        return  Ok(HttpResponse::ok())
+    };
+    drop(manager);
+
+    match tokio::time::timeout(tokio::time::Duration::from_secs(30), receiver.recv()).await {
+        Ok(Ok(message)) => {
+            state.pretty_print_message("[Server → HTTP Client]", &message);
+            let msg =  serde_json::from_str(&message).unwrap();
+            let mut stream = ctx.stream;
+            let _ = HttpResponse::ok().json(&msg).send(&mut stream).await;
+            return Ok(HttpResponse::ok())
+        }
+        Ok(Err(e)) => {
+            let error_resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32603, "message": format!("Broadcast error: {}", e)}
+            });
+            let mut stream = ctx.stream;
+            let _ = HttpResponse::ok().json(&error_resp).send(&mut stream).await;
+            return  Ok(HttpResponse::ok())
+        }
+        Err(_) => {
+            let error_resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32603, "message": "Timeout waiting for session/new response"}
+            });
+            let mut stream = ctx.stream;
+            let _ = HttpResponse::ok().json(&error_resp).send(&mut stream).await;
+            return  Ok(HttpResponse::ok())
+        }
+    }
+
+   
 }
 
 async fn handle_session_new(ctx: HandlerContext, state: HandlerState, json: Value, id: Option<Value>) -> Result<HttpResponse> {
@@ -225,7 +343,7 @@ async fn handle_session_new(ctx: HandlerContext, state: HandlerState, json: Valu
    
 }
 
-async fn handle_session_prompt(mut ctx: HandlerContext, json: Value, id: Option<Value>, state: HandlerState) -> Result<HttpResponse> {
+async fn handle_session_prompt_sse(ctx: HandlerContext, state: HandlerState, json: Value, id: Option<Value>) -> Result<HttpResponse> {
     let params = match json.get("params") {
         Some(p) => p,
         None => return Ok(HttpResponse::new(400).json(&serde_json::json!({
@@ -243,7 +361,7 @@ async fn handle_session_prompt(mut ctx: HandlerContext, json: Value, id: Option<
             "error": {"code": -32602, "message": "Missing sessionId"}
         }))),
     };
-
+    let cwd = params.get("cwd").and_then(|c| c.as_str()).unwrap_or(".").to_string();
     let session_manager = state.session_manager.clone();
     let request_str = format!("{}\n", json);
 
@@ -279,13 +397,17 @@ async fn handle_session_prompt(mut ctx: HandlerContext, json: Value, id: Option<
         }
     };
 
-    let stream = &mut ctx.stream;
-    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n").await?;
+    let mut stream = ctx.stream;
+
+    // Send SSE headers
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n").await?;
     stream.flush().await?;
 
     loop {
         match receiver.recv().await {
             Ok(message) => {
+
+                
                 let is_end = if let Ok(j) = serde_json::from_str::<Value>(&message) {
                     j.get("result")
                         .and_then(|r| r.get("stopReason"))
@@ -296,8 +418,12 @@ async fn handle_session_prompt(mut ctx: HandlerContext, json: Value, id: Option<
                     false
                 };
 
-                if stream.write_all(format!("data: {}\n\n", message).as_bytes()).await.is_err() {
-                    break;
+                if stream
+                    .write_all(format!("data: {}\n\n", message).as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return Ok(HttpResponse::ok());
                 }
                 if stream.flush().await.is_err() {
                     break;
@@ -311,6 +437,5 @@ async fn handle_session_prompt(mut ctx: HandlerContext, json: Value, id: Option<
         }
     }
 
-    std::mem::forget(ctx);
     Ok(HttpResponse::ok())
 }

@@ -1,11 +1,9 @@
 mod config;
 mod handlers;
 mod jsonrpc;
-mod message;
 mod router;
 mod routes;
 mod session;
-mod processing_http;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;

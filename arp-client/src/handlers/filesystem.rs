@@ -31,24 +31,24 @@ pub async fn handle_filesystem(ctx: HandlerContext, state: HandlerState) -> Resu
 
     let base_path_candidate = if let Some(session_id) = path_params.get("session_id").cloned() {
         session_id_for_response = Some(session_id.clone());
+        return Ok(HttpResponse::ok());
+        // let session = match state.session_manager.get_session(&session_id).await {
+        //     Some(session) => session,
+        //     None => {
+        //         let _ = json_error(404, "Session not found").send(&mut stream).await;
+        //         return Ok(HttpResponse::ok());
+        //     }
+        // };
 
-        let session = match state.session_manager.get_session(&session_id).await {
-            Some(session) => session,
-            None => {
-                let _ = json_error(404, "Session not found").send(&mut stream).await;
-                return Ok(HttpResponse::ok());
-            }
-        };
-
-        match session.get_project_path().await {
-            Some(path) => path,
-            None => {
-                let _ = json_error(404, "Project path unavailable for this session")
-                    .send(&mut stream)
-                    .await;
-                return Ok(HttpResponse::ok());
-            }
-        }
+        // match session.get_project_path().await {
+        //     Some(path) => path,
+        //     None => {
+        //         let _ = json_error(404, "Project path unavailable for this session")
+        //             .send(&mut stream)
+        //             .await;
+        //         return Ok(HttpResponse::ok());
+        //     }
+        // }
     } else {
         let project_path_raw = match request.query_param("project_path") {
             Some(value) if !value.trim().is_empty() => value.clone(),
@@ -169,7 +169,7 @@ pub async fn handle_filesystem(ctx: HandlerContext, state: HandlerState) -> Resu
                 404,
                 format!(
                     "Path not found: {}",
-                    decoded_path.trim_start_matches('/').to_string()
+                    decoded_path.trim_start_matches('/')
                 ),
             )
             .send(&mut stream)
@@ -318,14 +318,13 @@ async fn list_directory(base: &Path, target: &Path) -> Result<Vec<serde_json::Va
 
         let relative = entry_path
             .strip_prefix(base)
-            .unwrap_or_else(|_| entry_path.as_path())
+            .unwrap_or(entry_path.as_path())
             .to_string_lossy()
             .replace('\\', "/");
 
         let modified = metadata
             .modified()
-            .ok()
-            .and_then(|ts| Some(DateTime::<Utc>::from(ts).to_rfc3339()));
+            .ok().map(|ts| DateTime::<Utc>::from(ts).to_rfc3339());
 
         result.push(json!({
             "name": file_name,

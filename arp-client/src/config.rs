@@ -1,6 +1,9 @@
 use clap::Parser;
 use std::{env, fs};
 use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Configuration for the arpc client
 #[derive(Parser, Debug, Clone)]
@@ -61,6 +64,30 @@ pub struct ClientConfig {
     /// Enable filesystem browsing APIs
     #[arg(long)]
     pub enable_fs: bool,
+
+    /// Path to configuration file
+    #[arg(long)]
+    pub config: PathBuf,
+
+    /// HTTP port to listen on (for streamable HTTP/SSE)
+    #[arg(long, default_value = "3001")]
+    pub http_port: u16,
+
+    /// Suppress logging output
+    #[arg(short, long, default_value = "false")]
+    pub quiet: bool,
+
+    /// Show verbose I/O data (timestamp, length, raw data)
+    #[arg(short, long, default_value = "false")]
+    pub verbose: bool,
+
+    /// Show raw data without JSON pretty-printing
+    #[arg(long, default_value = "false")]
+    pub raw: bool,
+    
+    /// ACP configuration
+    #[clap(skip)]
+    pub acp_config: Option<ACPConfig>,
 }
 
 fn default_client_id() -> String {
@@ -133,11 +160,10 @@ impl ClientConfig {
         }
 
         // Validate command_path exists if provided
-        if let Some(ref cmd_path) = self.command_path {
-            if !cmd_path.trim().is_empty() && !std::path::Path::new(cmd_path).exists() {
+        if let Some(ref cmd_path) = self.command_path
+            && !cmd_path.trim().is_empty() && !std::path::Path::new(cmd_path).exists() {
                 return Err(format!("command_path does not exist: {}", cmd_path));
             }
-        }
 
         // Validate MCP port is different from control and proxy ports
         if self.enable_mcp {
@@ -183,22 +209,20 @@ impl ClientConfig {
             parts.push(format!("machine_id:{machine_id}"));
         }
 
-        if let Ok(user) = env::var("USER").or_else(|_| env::var("USERNAME")) {
-            if !user.is_empty() {
+        if let Ok(user) = env::var("USER").or_else(|_| env::var("USERNAME"))
+            && !user.is_empty() {
                 parts.push(format!("user:{user}"));
             }
-        }
 
         parts.push(format!("os:{}", env::consts::OS));
         parts.push(format!("arch:{}", env::consts::ARCH));
 
         #[cfg(target_os = "windows")]
         {
-            if let Ok(name) = env::var("COMPUTERNAME") {
-                if !name.is_empty() {
+            if let Ok(name) = env::var("COMPUTERNAME")
+                && !name.is_empty() {
                     parts.push(format!("computer:{name}"));
                 }
-            }
         }
 
         #[cfg(target_os = "linux")]
@@ -266,5 +290,42 @@ impl ClientConfig {
         } else {
             Some(trimmed.to_string())
         }
+    }
+}
+
+
+
+/// Configuration for an agent server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// Root configuration structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ACPConfig {
+    pub agent_servers: HashMap<String, AgentConfig>,
+    #[serde(default = "default_upload_dir")]
+    pub upload_dir: String,
+}
+
+fn default_upload_dir() -> String {
+    ".".to_string()
+}
+
+impl ACPConfig {
+    pub fn load(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string(path)?;
+        let config: ACPConfig = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
+    pub fn save(&self, path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
     }
 }

@@ -1,395 +1,288 @@
-use crate::executor::ExecutorKind;
-use serde_json::json;
+use crate::config::{AgentConfig, ACPConfig};
+use crate::handlers::{strip_content_length_header, HandlerState};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::task::JoinHandle;
+
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio::time::{Duration, Instant};
+use tokio::time::Instant;
 use tracing::{info, warn};
-use uuid::Uuid;
 
-/// Status of a command session
-#[derive(Debug, Clone, PartialEq)]
-pub enum SessionStatus {
-    Running,
-    Completed { exit_code: Option<i32> },
-    Failed { error: String },
-    Cancelled { reason: String },
+
+
+/// Executor type for command execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutorKind {
+    ACPAgent,
+    Command,
 }
 
-/// A buffered output line from command execution
-#[derive(Debug, Clone)]
-pub struct OutputLine {
-    pub line_number: usize,
-    pub content: String,
-    pub timestamp: Instant,
-}
 
-/// Session data for a running command
-pub struct CommandSession {
+/// Represents a single agent session
+pub struct Session {
     pub session_id: String,
-    pub agent_session: Arc<Mutex<Option<(ExecutorKind, String)>>>,
-    pub executor_kind: ExecutorKind,
-    pub status: Arc<RwLock<SessionStatus>>,
-    pub output_buffer: Arc<Mutex<Vec<OutputLine>>>,
-    pub last_accessed: Arc<Mutex<Instant>>,
-    pub total_lines: Arc<Mutex<usize>>,
-    /// Channel for new subscribers to receive output (using broadcast for multiple subscribers)
-    pub broadcast_tx: broadcast::Sender<OutputLine>,
-    /// Process handle for cancellation (only available while running)
-    pub process_handle: Arc<Mutex<Option<tokio::process::Child>>>,
-    pub project_path: Arc<RwLock<Option<PathBuf>>>,
+    pub agent_name: String,
+    pub child: Child,
+    pub stdin: ChildStdin,
+    pub stdout_task: JoinHandle<()>,
+    pub stderr_task: JoinHandle<()>,
+    pub real_session_id: Arc<Mutex<Option<String>>>,
+    pub created_at: String,
+    pub updated_at: Arc<Mutex<String>>,
+    pub cwd: String,
+    pub title: Option<String>,
+    pub output_tx: broadcast::Sender<String>,
 }
 
-impl CommandSession {
-    pub fn new(session_id: String, executor_kind: ExecutorKind) -> Self {
-        // Use broadcast channel with capacity of 1000 messages
-        let (tx, _rx) = broadcast::channel(1000);
+/// Manages multiple agent sessions
 
-        CommandSession {
-            session_id,
-            agent_session: Arc::new(Mutex::new(None)),
-            executor_kind,
-            status: Arc::new(RwLock::new(SessionStatus::Running)),
-            output_buffer: Arc::new(Mutex::new(Vec::new())),
-            last_accessed: Arc::new(Mutex::new(Instant::now())),
-            total_lines: Arc::new(Mutex::new(0)),
-            broadcast_tx: tx,
-            process_handle: Arc::new(Mutex::new(None)),
-            project_path: Arc::new(RwLock::new(None)),
-        }
-    }
-
-    /// Add a new output line
-    pub async fn add_output(&self, content: String) {
-        let mut total = self.total_lines.lock().await;
-        *total += 1;
-        let line_number = *total;
-
-        let output_line = OutputLine {
-            line_number,
-            content,
-            timestamp: Instant::now(),
-        };
-
-        // Add to buffer
-        let mut buffer = self.output_buffer.lock().await;
-        buffer.push(output_line.clone());
-
-        // Broadcast to any active subscribers
-        let _ = self.broadcast_tx.send(output_line);
-    }
-
-    /// Mark session as completed
-    pub async fn mark_completed(&self, exit_code: Option<i32>) {
-        let mut status = self.status.write().await;
-        *status = SessionStatus::Completed { exit_code };
-        info!("Session {} marked as completed", self.session_id);
-    }
-
-    /// Mark session as failed
-    pub async fn mark_failed(&self, error: String) {
-        let mut status = self.status.write().await;
-        *status = SessionStatus::Failed { error };
-        warn!("Session {} marked as failed", self.session_id);
-    }
-
-    /// Mark session as cancelled
-    pub async fn mark_cancelled(&self, reason: String) {
-        let mut status = self.status.write().await;
-        *status = SessionStatus::Cancelled { reason };
-        info!("Session {} marked as cancelled", self.session_id);
-    }
-
-    /// Cancel the running process
-    pub async fn cancel(&self) -> Result<(), String> {
-        let mut process = self.process_handle.lock().await;
-
-        if let Some(ref mut child) = *process {
-            match child.kill().await {
-                Ok(_) => {
-                    info!(
-                        "Process for session {} killed successfully",
-                        self.session_id
-                    );
-                    drop(process);
-                    self.mark_cancelled("User cancelled".to_string()).await;
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to kill process for session {}: {}",
-                        self.session_id, e
-                    );
-                    Err(format!("Failed to kill process: {}", e))
-                }
-            }
-        } else {
-            Err("No process handle available (process may have already completed)".to_string())
-        }
-    }
-
-    /// Set the process handle for this session
-    pub async fn set_process_handle(&self, child: tokio::process::Child) {
-        let mut handle = self.process_handle.lock().await;
-        *handle = Some(child);
-    }
-
-    /// Update last accessed time
-    pub async fn touch(&self) {
-        let mut last_accessed = self.last_accessed.lock().await;
-        *last_accessed = Instant::now();
-    }
-
-    /// Retrieve current execution status
-    pub async fn get_status(&self) -> SessionStatus {
-        let status = self.status.read().await;
-        status.clone()
-    }
-
-    /// Set Claude session ID
-    pub async fn set_agent_session(&self, kind: ExecutorKind, agent_session_id: String) {
-        let mut agent_session = self.agent_session.lock().await;
-        *agent_session = Some((kind, agent_session_id.clone()));
-        info!(
-            "Session {} linked to {} session: {}",
-            self.session_id,
-            kind.as_str(),
-            agent_session_id
-        );
-    }
-
-    /// Get agent session info
-    pub async fn get_agent_session(&self) -> Option<(ExecutorKind, String)> {
-        let agent_session = self.agent_session.lock().await;
-        agent_session.clone()
-    }
-
-    /// Get all output lines from a specific line number
-    pub async fn get_output_from(&self, from_line: usize) -> Vec<OutputLine> {
-        let buffer = self.output_buffer.lock().await;
-        buffer
-            .iter()
-            .filter(|line| line.line_number >= from_line)
-            .cloned()
-            .collect()
-    }
-
-    /// Create a new receiver for broadcast updates
-    pub fn subscribe(&self) -> broadcast::Receiver<OutputLine> {
-        self.broadcast_tx.subscribe()
-    }
-
-    pub async fn set_project_path<P>(&self, path: P)
-    where
-        P: AsRef<Path>,
-    {
-        let mut project_path = self.project_path.write().await;
-        *project_path = Some(path.as_ref().to_path_buf());
-    }
-
-    pub async fn get_project_path(&self) -> Option<PathBuf> {
-        let project_path = self.project_path.read().await;
-        project_path.clone()
-    }
-}
-
-/// Session manager for tracking command executions
-#[derive(Clone)]
 pub struct SessionManager {
-    sessions: Arc<Mutex<HashMap<String, Arc<CommandSession>>>>,
+    pub sessions: HashMap<String, Session>,
     agent_session_map: Arc<Mutex<HashMap<(ExecutorKind, String), String>>>,
+    config: ACPConfig,
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
-        let manager = SessionManager {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+    pub fn new(config: ACPConfig) -> Self {
+        Self {
+            sessions: HashMap::new(),
             agent_session_map: Arc::new(Mutex::new(HashMap::new())),
+            config,
+        }
+    }
+
+    /// Create a new session and spawn the agent process
+    pub async fn create_session(
+        &mut self,
+        agent_name: &str,
+        cwd: String,
+        state: Arc<HandlerState>,
+        session_manager: Arc<Mutex<SessionManager>>,
+    ) -> Result<String, String> {
+        let agent_config = self.config.agent_servers.get(agent_name)
+            .ok_or_else(|| format!("Agent '{}' not found in configuration", agent_name))?
+            .clone();
+
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut shell_cmd = Command::new("cmd");
+            let mut full_args = vec!["/C".to_string(), agent_config.command.clone()];
+            full_args.extend(agent_config.args.iter().cloned());
+            shell_cmd.args(&full_args);
+            shell_cmd
+        } else {
+            let mut cmd = Command::new(&agent_config.command);
+            cmd.args(&agent_config.args);
+            cmd
         };
 
-        // Start cleanup task
-        let manager_clone = manager.clone();
-        tokio::spawn(async move {
-            manager_clone.cleanup_loop().await;
-        });
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        manager
-    }
-
-    /// Create a new session with specific executor
-    pub async fn create_session_with_executor(
-        &self,
-        executor: ExecutorKind,
-    ) -> Arc<CommandSession> {
-        let session_id = Uuid::new_v4().to_string();
-        let session = Arc::new(CommandSession::new(session_id.clone(), executor));
-
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(session_id.clone(), session.clone());
-
-        info!(
-            "Created new session: {} with executor: {}",
-            session_id,
-            executor.as_str()
-        );
-        session
-    }
-
-    /// Create a new session with a custom session ID
-    pub async fn create_session_with_id(&self, session_id: String) -> Arc<CommandSession> {
-        self.create_session_with_id_and_executor(session_id, ExecutorKind::Claude)
-            .await
-    }
-
-    /// Create a new session with custom ID and executor
-    pub async fn create_session_with_id_and_executor(
-        &self,
-        session_id: String,
-        executor: ExecutorKind,
-    ) -> Arc<CommandSession> {
-        let session = Arc::new(CommandSession::new(session_id.clone(), executor));
-
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(session_id.clone(), session.clone());
-
-        info!(
-            "Created new session with custom ID: {} executor: {}",
-            session_id,
-            executor.as_str()
-        );
-        session
-    }
-
-    /// Get an existing session
-    pub async fn get_session(&self, session_id: &str) -> Option<Arc<CommandSession>> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions.get(session_id).cloned();
-
-        if let Some(ref s) = session {
-            s.touch().await;
+        for (key, value) in &agent_config.env {
+            cmd.env(key, value);
         }
 
-        session
-    }
+        let mut child = cmd.spawn()
+            .map_err(|e| format!("Failed to spawn child process: {}", e))?;
 
-    /// Register executor-specific session ID mapping
-    pub async fn register_agent_session(
-        &self,
-        executor_kind: ExecutorKind,
-        agent_session_id: String,
-        session: &Arc<CommandSession>,
-    ) {
-        session
-            .set_agent_session(executor_kind, agent_session_id.clone())
-            .await;
+        let stdin = child.stdin.take()
+            .ok_or_else(|| "Failed to open stdin".to_string())?;
+        let stdout = child.stdout.take()
+            .ok_or_else(|| "Failed to open stdout".to_string())?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| "Failed to open stderr".to_string())?;
 
-        let mut agent_map = self.agent_session_map.lock().await;
-        agent_map.insert(
-            (executor_kind, agent_session_id),
-            session.session_id.clone(),
-        );
-    }
+        let stdout_reader = BufReader::new(stdout);
+        let stderr_reader = BufReader::new(stderr);
 
-    /// Cancel a running session
-    pub async fn cancel_session(&self, session_id: &str) -> Result<(), String> {
-        let session = self
-            .get_session(session_id)
-            .await
-            .ok_or_else(|| format!("Session not found: {}", session_id))?;
+        let temp_session_id = format!("temp-{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis());
 
-        session.cancel().await
-    }
+        let real_session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let (output_tx, _output_rx) = broadcast::channel::<String>(1000);
 
-    /// Remove a session
-    pub async fn remove_session(&self, session_id: &str) {
-        let mut sessions = self.sessions.lock().await;
+        let stdout_task = {
+            let state = state.clone();
+            let real_session_id = real_session_id.clone();
+            let temp_session_id = temp_session_id.clone();
+            let session_manager = session_manager.clone();
+            let output_tx = output_tx.clone();
 
-        // Get the session to retrieve its Claude session ID
-        if let Some(session) = sessions.get(session_id) {
-            if let Some(agent_info) = session.get_agent_session().await {
-                let mut agent_map = self.agent_session_map.lock().await;
-                agent_map.remove(&agent_info);
-            }
-        }
+            tokio::spawn(async move {
+                let mut lines = stdout_reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut content = strip_content_length_header(&line);
 
-        sessions.remove(session_id);
-        info!("Removed session: {}", session_id);
-    }
+                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                        if let Some(result) = json.get("result") {
+                            if let Some(session_id) = result.get("sessionId").and_then(|s| s.as_str()) {
+                                state.log(&format!("Received sessionId from child: {}", session_id));
 
-    /// Cleanup old sessions periodically
-    async fn cleanup_loop(&self) {
-        let cleanup_interval = Duration::from_secs(60); // Check every minute
-        let session_timeout = Duration::from_secs(3600); // 1 hour timeout
+                                let mut manager = session_manager.lock().await;
+                                manager.update_session_id(&temp_session_id, session_id).await;
 
-        loop {
-            tokio::time::sleep(cleanup_interval).await;
-
-            let mut sessions = self.sessions.lock().await;
-            let mut agent_map = self.agent_session_map.lock().await;
-            let now = Instant::now();
-
-            // Find expired sessions
-            let expired: Vec<(String, Option<(ExecutorKind, String)>)> = {
-                let mut expired = Vec::new();
-                for (id, session) in sessions.iter() {
-                    let last_accessed = session.last_accessed.lock().await;
-                    if now.duration_since(*last_accessed) > session_timeout {
-                        let agent_info = session.get_agent_session().await;
-                        expired.push((id.clone(), agent_info));
+                                *real_session_id.lock().await = Some(session_id.to_string());
+                            }
+                        }
                     }
-                }
-                expired
-            };
 
-            // Remove expired sessions
-            for (id, agent_info) in expired {
-                sessions.remove(&id);
-                if let Some(agent_info) = agent_info {
-                    agent_map.remove(&agent_info);
+                    if let Some(session_id) = real_session_id.lock().await.as_ref() {
+                        content = add_session_id_to_message(&content, session_id);
+                    }
+
+                    state.pretty_print_message("[Server → Client]", &content);
+                    let _ = output_tx.send(content);
                 }
-                info!("Cleaned up expired session: {}", id);
+            })
+        };
+
+        let stderr_task = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut lines = stderr_reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    state.log_error(&format!("Child stderr: {}", line));
+                }
+            })
+        };
+
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let updated_at = Arc::new(Mutex::new(created_at.clone()));
+
+        let session = Session {
+            session_id: temp_session_id.clone(),
+            agent_name: agent_name.to_string(),
+            child,
+            stdin,
+            stdout_task,
+            stderr_task,
+            real_session_id: real_session_id.clone(),
+            created_at,
+            updated_at,
+            cwd,
+            title: None,
+            output_tx,
+        };
+
+        self.sessions.insert(temp_session_id.clone(), session);
+
+        Ok(temp_session_id)
+    }
+
+    /// Update the session ID after receiving response from child
+    pub async fn update_session_id(&mut self, old_id: &str, new_id: &str) {
+        if let Some(mut session) = self.sessions.remove(old_id) {
+            session.session_id = new_id.to_string();
+            *session.real_session_id.lock().await = Some(new_id.to_string());
+            *session.updated_at.lock().await = chrono::Utc::now().to_rfc3339();
+            self.sessions.insert(new_id.to_string(), session);
+        }
+    }
+
+    pub fn list_sessions(&self) -> Vec<serde_json::Value> {
+        self.sessions.values().map(|s| {
+            let updated = s.updated_at.try_lock().map(|u| u.clone()).unwrap_or_else(|_| s.created_at.clone());
+            serde_json::json!({
+                "sessionId": s.session_id,
+                "createdAt": s.created_at,
+                "updatedAt": updated,
+                "cwd": s.cwd,
+                "title": s.title,
+                "_meta": {"agentName": s.agent_name}
+            })
+        }).collect()
+    }
+
+    pub fn get_session_stdin(&mut self, session_id: &str) -> Option<&mut ChildStdin> {
+        self.sessions.get_mut(session_id).map(|s| &mut s.stdin)
+    }
+
+    pub fn subscribe_to_session(&self, session_id: &str) -> Option<broadcast::Receiver<String>> {
+        self.sessions.get(session_id).map(|s| s.output_tx.subscribe())
+    }
+
+    pub async fn close_session(&mut self, session_id: &str, state: Arc<HandlerState>) {
+        if let Some(mut session) = self.sessions.remove(session_id) {
+            state.log(&format!("Closing session: {}", session_id));
+            drop(session.stdin);
+            let timeout = tokio::time::Duration::from_secs(5);
+            let _ = tokio::time::timeout(timeout, session.stdout_task).await;
+            let _ = tokio::time::timeout(timeout, session.stderr_task).await;
+            let _ = session.child.kill().await;
+            match session.child.wait().await {
+                Ok(status) => state.log(&format!("Session {} exited with code {:?}", session_id, status.code())),
+                Err(e) => state.log_error(&format!("Failed to wait for child process: {}", e)),
             }
         }
     }
 
-    /// Get session statistics
-    pub async fn get_stats(&self) -> serde_json::Value {
-        let sessions = self.sessions.lock().await;
-
-        let mut running = 0;
-        let mut completed = 0;
-        let mut failed = 0;
-        let mut cancelled = 0;
-
-        for session in sessions.values() {
-            let status = session.status.read().await;
-            match *status {
-                SessionStatus::Running => running += 1,
-                SessionStatus::Completed { .. } => completed += 1,
-                SessionStatus::Failed { .. } => failed += 1,
-                SessionStatus::Cancelled { .. } => cancelled += 1,
-            }
-        }
-
-        json!({
-            "total_sessions": sessions.len(),
-            "running": running,
-            "completed": completed,
-            "failed": failed,
-            "cancelled": cancelled
-        })
+    /// List all configured agents
+    pub fn list_agents(&self) -> Vec<(String, AgentConfig)> {
+        self.config.agent_servers.iter()
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect()
     }
 
-    /// Query session status by session ID
-    pub async fn get_session_status(&self, session_id: &str) -> Option<SessionStatus> {
-        let session = self.get_session(session_id).await?;
-        Some(session.get_status().await)
+    /// Get a specific agent configuration
+    pub fn get_agent(&self, name: &str) -> Option<AgentConfig> {
+        self.config.agent_servers.get(name).cloned()
+    }
+
+    /// Add a new agent configuration
+    pub fn add_agent(&mut self, name: String, config: AgentConfig) -> Result<(), String> {
+        if self.config.agent_servers.contains_key(&name) {
+            return Err(format!("Agent '{}' already exists", name));
+        }
+        self.config.agent_servers.insert(name, config);
+        Ok(())
+    }
+
+    /// Update an existing agent configuration
+    pub fn update_agent(&mut self, name: &str, config: AgentConfig) -> Result<(), String> {
+        if !self.config.agent_servers.contains_key(name) {
+            return Err(format!("Agent '{}' not found", name));
+        }
+        self.config.agent_servers.insert(name.to_string(), config);
+        Ok(())
+    }
+
+    /// Delete an agent configuration
+    pub fn delete_agent(&mut self, name: &str) -> Result<(), String> {
+        if !self.config.agent_servers.contains_key(name) {
+            return Err(format!("Agent '{}' not found", name));
+        }
+        self.config.agent_servers.remove(name);
+        Ok(())
+    }
+
+    /// Save configuration to file
+    pub fn save_config(&self, path: &PathBuf) -> Result<(), String> {
+        self.config.save(path).map_err(|e| format!("Failed to save config: {}", e))
     }
 }
 
-impl Default for SessionManager {
-    fn default() -> Self {
-        Self::new()
+fn add_session_id_to_message(message: &str, session_id: &str) -> String {
+    let Ok(mut json) = serde_json::from_str::<Value>(message) else {
+        return message.to_string();
+    };
+
+    let meta = serde_json::json!({"sessionId": session_id});
+
+    if let Some(obj) = json["result"].as_object_mut() {
+        obj.entry("_meta").or_insert(meta);
+    } else if let Some(obj) = json["params"].as_object_mut() {
+        if obj.contains_key("sessionId") {
+            obj.entry("_meta").or_insert(meta);
+        }
     }
+
+    serde_json::to_string(&json).unwrap_or_else(|_| message.to_string())
 }

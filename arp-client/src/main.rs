@@ -1,11 +1,11 @@
-mod agentx;
 mod config;
-mod executor;
 mod handlers;
-mod mcp;
+mod jsonrpc;
+mod message;
 mod router;
 mod routes;
 mod session;
+mod processing_http;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
@@ -18,12 +18,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io;
 use tokio::net::TcpStream;
+use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::config::ACPConfig;
+use crate::session::SessionManager;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = ClientConfig::parse();
+    let mut config = ClientConfig::parse();
 
     // Setup dual logging: all levels -> file, INFO -> terminal
     let log_dir = dirs::data_local_dir()
@@ -52,6 +56,51 @@ async fn main() -> Result<()> {
         error!("Configuration validation failed: {}", e);
         return Err(anyhow!("Invalid configuration: {}", e));
     }
+    let acp_config = match ACPConfig::load(&config.config) {
+        Ok(acp_config) => acp_config,
+        Err(e) => {
+            eprintln!("Failed to load configuration file: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    config.acp_config = Some(acp_config.clone());
+
+
+    let session_manager = Arc::new(Mutex::new(SessionManager::new(acp_config.clone())));
+    // let (global_broadcast_tx, _global_broadcast_rx) = broadcast::channel::<String>(1000);
+
+        // Create shared state
+    // let state = HandlerState::new(config.clone());
+    let state = HandlerState {
+        config: Arc::new(config.clone()),
+        quiet: config.quiet,
+        verbose: config.verbose,
+        raw: config.raw,
+        config_path: config.config.clone(),
+        upload_dir: acp_config.upload_dir.clone(),
+        session_manager: session_manager.clone(),
+    };
+
+    state.log(&format!(
+        "HTTP server listening on port {}",
+        config.http_port
+    ));
+    state.log(&format!(
+        "Available agents: {}",
+        acp_config
+            .agent_servers
+            .keys()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    if config.verbose {
+        state.log("Verbose mode enabled - showing timestamps and data length");
+    }
+    if config.raw {
+        state.log("Raw mode enabled - showing raw data without JSON formatting");
+    }
 
     info!(
         "✅ Starting arpc with client_id（Token）: {}",
@@ -64,20 +113,6 @@ async fn main() -> Result<()> {
     } else {
         info!("Local service: {}", config.local_service_addr());
     }
-
-    // Start MCP server if enabled
-    if config.enable_mcp {
-        let mcp_port = config.mcp_port;
-        tokio::spawn(async move {
-            if let Err(e) = mcp::start_mcp_server(mcp_port).await {
-                error!("MCP server error: {}", e);
-            }
-        });
-        info!("MCP server enabled on port {}", config.mcp_port);
-    }
-
-    // Create shared state
-    let state = HandlerState::new(config.clone());
 
     // Extract Arc-wrapped config to avoid repeated cloning in the loop
     let config_arc = state.config.clone();

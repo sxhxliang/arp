@@ -1,0 +1,38 @@
+{
+  "agent_servers": {
+    "Claude": {
+      "command": "claude-code-acp",
+      "args": [],
+      "env": {}
+    },
+    "Codex": {
+      "command": "codex-acp",
+      "args": [],
+      "env": {}
+    },
+    "Gemini": {
+      "command": "gemini",
+      "args": ["--experimental-acp"],
+      "env": {}
+    },
+    "QwenCode": {
+      "command": "qwen",
+      "args": ["--experimental-acp"],
+      "env": {}
+    },
+    "Iflow": {
+      "command": "npx",
+      "args": ["@iflow-ai/iflow-cli", "--experimental-acp"],
+      "env": {}
+    },
+    "Kimi": {
+      "command": "kimi",
+      "args": ["--acp"],
+      "env": {}
+    },
+    "OpenCode": {
+      "command": "opencode",
+      "args": ["acp"]
+    }
+  }
+}

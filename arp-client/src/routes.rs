@@ -11,12 +11,31 @@ pub fn build_router(state: HandlerState) -> Router {
 }
 
 fn register_session_routes(router_builder: &mut RouterBuilder, state: &HandlerState) {
-    // POST /api/sessions - Create new command execution session
-    router_builder.post("/api/sessions", {
+    
+        // GET /api/sessions/{session_id} - Get session details or reconnect to active session
+    router_builder.get("/api/agents", {
+        let state = state.clone();
+        move |ctx| {
+            let state = state.clone();
+            async move { handlers::session::handle_agents(ctx, state).await }
+        }
+    });
+    // POST /acp/session/message - Create new command execution session
+    router_builder.post("/acp/session/message", {
+        println!("POST /acp/session/message");
         let state = state.clone();
         move |ctx| {
             let state = state.clone();
             async move { handlers::session::handle_session(ctx, state).await }
+        }
+    });
+
+    router_builder.get("/acp/session/message", {
+        println!("GET /acp/session/message");
+        let state = state.clone();
+        move |ctx| {
+            let state = state.clone();
+            async move { handlers::session::handle_agents(ctx, state).await }
         }
     });
 

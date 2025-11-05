@@ -11,34 +11,26 @@ pub fn build_router(state: HandlerState) -> Router {
 }
 
 fn register_session_routes(router_builder: &mut RouterBuilder, state: &HandlerState) {
-    
-        // GET /api/sessions/{session_id} - Get session details or reconnect to active session
+    // GET /api/sessions/{session_id} - Get session details or reconnect to active session
     router_builder.get("/api/agents", {
         let state = state.clone();
         move |ctx| {
             let state = state.clone();
-            async move { handlers::session::handle_agents(ctx, state).await }
+            async move { handlers::session::handle_agents(ctx, state, "list").await }
         }
     });
-    router_builder.get("/api/agents/{name}", {
+    router_builder.post("/api/agents", {
         let state = state.clone();
         move |ctx| {
             let state = state.clone();
-            async move { handlers::session::handle_agents(ctx, state).await }
-        }
-    });
-    router_builder.post("/api/agents/{name}", {
-        let state = state.clone();
-        move |ctx| {
-            let state = state.clone();
-            async move { handlers::session::handle_agents(ctx, state).await }
+            async move { handlers::session::handle_agents(ctx, state, "add").await }
         }
     });
     router_builder.delete("/api/agents/{name}", {
         let state = state.clone();
         move |ctx| {
             let state = state.clone();
-            async move { handlers::session::handle_agents(ctx, state).await }
+            async move { handlers::session::handle_agents(ctx, state, "delete").await }
         }
     });
     // POST /acp/session/message - Create new command execution session
@@ -56,7 +48,7 @@ fn register_session_routes(router_builder: &mut RouterBuilder, state: &HandlerSt
         let state = state.clone();
         move |ctx| {
             let state = state.clone();
-            async move { handlers::session::handle_agents(ctx, state).await }
+            async move { handlers::session::handle_session(ctx, state).await }
         }
     });
 

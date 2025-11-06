@@ -11,13 +11,6 @@ use tokio::task::JoinHandle;
 
 use tokio::sync::{Mutex, broadcast};
 
-/// Executor type for command execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ExecutorKind {
-    ACPAgent,
-    Command,
-}
-
 /// Represents a single agent session
 pub struct Session {
     pub session_id: String,
@@ -38,7 +31,6 @@ pub struct Session {
 
 pub struct SessionManager {
     pub sessions: HashMap<String, Session>,
-    agent_session_map: Arc<Mutex<HashMap<(ExecutorKind, String), String>>>,
     config: ACPConfig,
 }
 
@@ -46,7 +38,6 @@ impl SessionManager {
     pub fn new(config: ACPConfig) -> Self {
         Self {
             sessions: HashMap::new(),
-            agent_session_map: Arc::new(Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -255,26 +246,9 @@ impl SessionManager {
             .collect()
     }
 
-    /// Get a specific agent configuration
-    pub fn get_agent(&self, name: &str) -> Option<AgentConfig> {
-        self.config.agent_servers.get(name).cloned()
-    }
-
-    /// Add a new agent configuration
+    /// Add a new agent configuration or Update an existing agent configuration
     pub fn add_agent(&mut self, name: String, config: AgentConfig) -> Result<(), String> {
-        if self.config.agent_servers.contains_key(&name) {
-            return Err(format!("Agent '{}' already exists", name));
-        }
         self.config.agent_servers.insert(name, config);
-        Ok(())
-    }
-
-    /// Update an existing agent configuration
-    pub fn update_agent(&mut self, name: &str, config: AgentConfig) -> Result<(), String> {
-        if !self.config.agent_servers.contains_key(name) {
-            return Err(format!("Agent '{}' not found", name));
-        }
-        self.config.agent_servers.insert(name.to_string(), config);
         Ok(())
     }
 

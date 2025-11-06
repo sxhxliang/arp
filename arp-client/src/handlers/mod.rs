@@ -1,4 +1,3 @@
-pub mod filesystem;
 pub mod proxy;
 pub mod session;
 

@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub mod http;
+pub mod router;
 
 /// Commands exchanged between client and server.
 #[derive(Serialize, Deserialize, Debug, Clone)]

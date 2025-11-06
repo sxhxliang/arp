@@ -2,17 +2,16 @@ mod agentx;
 mod config;
 mod handlers;
 mod jsonrpc;
-mod router;
 mod routes;
 mod session;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use common::http;
+use common::router::{HandlerContext, Router};
 use common::{Command, read_command, write_command};
 use config::ClientConfig;
 use handlers::HandlerState;
-use router::{HandlerContext, Router};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io;

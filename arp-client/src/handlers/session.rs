@@ -2,9 +2,9 @@ use crate::agentx;
 use crate::config::AgentConfig;
 use crate::handlers::HandlerState;
 use crate::jsonrpc;
-use crate::router::HandlerContext;
 use anyhow::Result;
 use common::http::HttpResponse;
+use common::router::HandlerContext;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -167,9 +167,9 @@ pub async fn handle_session(ctx: HandlerContext, state: HandlerState) -> Result<
     match method {
         "session/new" => handle_session_new(ctx, state, json, id.as_ref()).await,
         "initialize" | "session/set_mode" | "session/set_model" | "session/cancel" => {
-            handle_session_single_message(ctx, state, json, id.as_ref()).await
+            handle_session_json_response(ctx, state, json, id.as_ref()).await
         }
-        "session/prompt" => handle_session_prompt_sse(ctx, state, json, id.as_ref()).await,
+        "session/prompt" => handle_session_sse_response(ctx, state, json, id.as_ref()).await,
         "session/list" => {
             state.log("Received session/list request");
             let sessions = state.session_manager.lock().await.list_sessions();
@@ -185,7 +185,7 @@ pub async fn handle_session(ctx: HandlerContext, state: HandlerState) -> Result<
     }
 }
 
-async fn handle_session_single_message(
+async fn handle_session_json_response(
     ctx: HandlerContext,
     state: HandlerState,
     json: Value,
@@ -274,7 +274,7 @@ async fn handle_session_new(
     }
 }
 
-async fn handle_session_prompt_sse(
+async fn handle_session_sse_response(
     ctx: HandlerContext,
     state: HandlerState,
     json: Value,

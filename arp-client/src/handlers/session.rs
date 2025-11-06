@@ -9,6 +9,16 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
+// Constants
+const SESSION_RESPONSE_TIMEOUT_SECS: u64 = 30;
+const SSE_HEADERS: &str = "HTTP/1.1 200 OK\r\n\
+    Content-Type: text/event-stream\r\n\
+    Cache-Control: no-cache\r\n\
+    Connection: keep-alive\r\n\
+    Access-Control-Allow-Origin: *\r\n\
+    Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n\
+    Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n";
+
 /// Helper to send JSON response
 async fn send_json_response(
     mut stream: tokio::net::TcpStream,
@@ -54,7 +64,7 @@ async fn wait_for_response(
     receiver: &mut tokio::sync::broadcast::Receiver<String>,
     id: Option<&Value>,
 ) -> Result<Value, Value> {
-    match tokio::time::timeout(tokio::time::Duration::from_secs(30), receiver.recv()).await {
+    match tokio::time::timeout(tokio::time::Duration::from_secs(SESSION_RESPONSE_TIMEOUT_SECS), receiver.recv()).await {
         Ok(Ok(message)) => serde_json::from_str(&message)
             .map_err(|_| jsonrpc::error_response(id, -32603, "Invalid JSON response")),
         Ok(Err(e)) => Err(jsonrpc::error_response(
@@ -68,6 +78,56 @@ async fn wait_for_response(
             "Timeout waiting for response",
         )),
     }
+}
+
+/// Generic helper to handle session requests with JSON responses
+async fn handle_session_request_with_json_response(
+    ctx: HandlerContext,
+    state: HandlerState,
+    json: Value,
+    id: Option<&Value>,
+    session_id_extractor: impl Fn(&Value) -> Option<&str>,
+    data_field_name: &str,
+) -> Result<HttpResponse> {
+    let data = match json.get(data_field_name) {
+        Some(p) => p,
+        None => return send_error(ctx.stream, id, -32602, &format!("Invalid {}", data_field_name)).await,
+    };
+
+    let session_id = match session_id_extractor(data) {
+        Some(s) => s,
+        None => return send_error(ctx.stream, id, -32602, "Missing _meta.sessionId").await,
+    };
+
+    let mut manager = state.session_manager.lock().await;
+    let mut receiver = match validate_and_write_to_session(&mut manager, session_id, &json).await {
+        Ok(rx) => rx,
+        Err(msg) => {
+            drop(manager);
+            return send_error(ctx.stream, id, -32603, msg).await;
+        }
+    };
+    drop(manager);
+
+    match wait_for_response(&mut receiver, id).await {
+        Ok(msg) => {
+            state.pretty_print_message("[Server → HTTP Client]", &msg.to_string());
+            send_json_response(ctx.stream, &msg).await
+        }
+        Err(error) => send_json_response(ctx.stream, &error).await,
+    }
+}
+
+/// Helper to validate session and write request
+async fn validate_and_write_to_session(
+    manager: &mut tokio::sync::MutexGuard<'_, crate::session::SessionManager>,
+    session_id: &str,
+    json: &Value,
+) -> Result<tokio::sync::broadcast::Receiver<String>, &'static str> {
+    if !manager.sessions.contains_key(session_id) {
+        return Err("Session not found");
+    }
+    write_to_session_and_subscribe(manager, session_id, json).await
 }
 
 pub async fn handle_agents(
@@ -85,7 +145,7 @@ pub async fn handle_agents(
             let agents_json: Vec<Value> = agents
                 .iter()
                 .map(|(name, config)| {
-                    serde_json::json!({
+                    json!({
                         "name": name,
                         "command": config.command,
                         "args": config.args,
@@ -94,62 +154,54 @@ pub async fn handle_agents(
                 })
                 .collect();
 
-            serde_json::json!({"success": true, "agents": agents_json})
+            json!({"success": true, "agents": agents_json})
         }
         "add" => {
             let json: Value = match ctx.request.body_as_json() {
                 Ok(json) => json,
                 Err(e) => {
-                    let error = serde_json::json!({
+                    return send_json_response(ctx.stream, &json!({
                         "success": false,
                         "error": format!("Invalid JSON: {}", e)
-                    });
-
-                    return send_json_response(ctx.stream, &error).await;
+                    })).await;
                 }
             };
             let name = match json.get("name").and_then(|n| n.as_str()) {
                 Some(n) => n.to_string(),
                 None => {
-                    let error = serde_json::json!({
+                    return send_json_response(ctx.stream, &json!({
                         "success": false,
                         "error": "Missing 'name' field"
-                    });
-                    return send_json_response(ctx.stream, &error).await;
+                    })).await;
                 }
             };
 
-            let agent_config: AgentConfig = match serde_json::from_value(json.clone()) {
+            let agent_config: AgentConfig = match serde_json::from_value(json) {
                 Ok(config) => config,
                 Err(e) => {
-                    let error = serde_json::json!({
+                    return send_json_response(ctx.stream, &json!({
                         "success": false,
                         "error": format!("Invalid agent configuration: {}", e)
-                    });
-                    return send_json_response(ctx.stream, &error).await;
+                    })).await;
                 }
             };
-            match manager.add_agent(name, agent_config) {
-                Ok(_) => serde_json::json!({"success": true, "agents": json}),
-                Err(_) => serde_json::json!({"success": false, "agents": json}),
+            match manager.add_agent(name.clone(), agent_config) {
+                Ok(_) => json!({"success": true, "agent": name}),
+                Err(_) => json!({"success": false, "error": "Failed to add agent"}),
             }
         }
         "delete" => {
-            let name = &ctx.request.path.trim_start_matches("/api/agents/");
+            let name = ctx.request.path.trim_start_matches("/api/agents/");
             match manager.delete_agent(name) {
                 Ok(_) => json!({"success": true}),
-                Err(e) => {
-                    let error = json!({
-                        "success": false,
-                        "error": format!("Invalid agent configuration: {}", e)
-                    });
-                    error
-                    // return send_json_response(ctx.stream, &error).await
-                }
+                Err(e) => json!({
+                    "success": false,
+                    "error": format!("Failed to delete agent: {}", e)
+                }),
             }
         }
         _ => {
-            serde_json::json!({"success": false, "error": "Invalid command"})
+            json!({"success": false, "error": "Invalid command"})
         }
     };
 
@@ -174,7 +226,7 @@ pub async fn handle_session(ctx: HandlerContext, state: HandlerState) -> Result<
             state.log("Received session/list request");
             let sessions = state.session_manager.lock().await.list_sessions();
             let response =
-                jsonrpc::success_response(id.as_ref(), serde_json::json!({"sessions": sessions}));
+                jsonrpc::success_response(id.as_ref(), json!({"sessions": sessions}));
             state.pretty_print_message(
                 "[Server → Client]",
                 &serde_json::to_string(&response).unwrap(),
@@ -193,37 +245,7 @@ async fn handle_session_permission_response(
     json: Value,
     id: Option<&Value>,
 ) -> Result<HttpResponse> {
-    let result = match json.get("result") {
-        Some(p) => p,
-        None => return send_error(ctx.stream, id, -32602, "Invalid result").await,
-    };
-
-    let session_id = match jsonrpc::extract_session_id(result) {
-        Some(s) => s,
-        None => return send_error(ctx.stream, id, -32602, "Missing _meta.sessionId").await,
-    };
-
-    let mut manager = state.session_manager.lock().await;
-
-    // Check if session exists before attempting to write
-    if !manager.sessions.contains_key(session_id) {
-        drop(manager);
-        return send_error(ctx.stream, id, -32001, "Session not found").await;
-    }
-
-    let mut receiver = match write_to_session_and_subscribe(&mut manager, session_id, &json).await {
-        Ok(rx) => rx,
-        Err(msg) => return send_error(ctx.stream, id, -32603, msg).await,
-    };
-    drop(manager);
-
-    match wait_for_response(&mut receiver, id).await {
-        Ok(msg) => {
-            state.pretty_print_message("[Server → HTTP Client]", &msg.to_string());
-            send_json_response(ctx.stream, &msg).await
-        }
-        Err(error) => send_json_response(ctx.stream, &error).await,
-    }
+    handle_session_request_with_json_response(ctx, state, json, id, jsonrpc::extract_session_id, "result").await
 }
 
 async fn handle_session_json_response(
@@ -232,37 +254,7 @@ async fn handle_session_json_response(
     json: Value,
     id: Option<&Value>,
 ) -> Result<HttpResponse> {
-    let params = match json.get("params") {
-        Some(p) => p,
-        None => return send_error(ctx.stream, id, -32602, "Invalid params").await,
-    };
-
-    let session_id = match jsonrpc::extract_session_id(params) {
-        Some(s) => s,
-        None => return send_error(ctx.stream, id, -32602, "Missing _meta.sessionId").await,
-    };
-
-    let mut manager = state.session_manager.lock().await;
-
-    // Check if session exists before attempting to write
-    if !manager.sessions.contains_key(session_id) {
-        drop(manager);
-        return send_error(ctx.stream, id, -32001, "Session not found").await;
-    }
-
-    let mut receiver = match write_to_session_and_subscribe(&mut manager, session_id, &json).await {
-        Ok(rx) => rx,
-        Err(msg) => return send_error(ctx.stream, id, -32603, msg).await,
-    };
-    drop(manager);
-
-    match wait_for_response(&mut receiver, id).await {
-        Ok(msg) => {
-            state.pretty_print_message("[Server → HTTP Client]", &msg.to_string());
-            send_json_response(ctx.stream, &msg).await
-        }
-        Err(error) => send_json_response(ctx.stream, &error).await,
-    }
+    handle_session_request_with_json_response(ctx, state, json, id, jsonrpc::extract_session_id, "params").await
 }
 
 async fn handle_session_new(
@@ -304,7 +296,7 @@ async fn handle_session_new(
     state.log(&format!("Created session for agent: {}", agent_name));
 
     let request =
-        serde_json::json!({"id": id, "jsonrpc": "2.0", "method": "session/new", "params": params});
+        json!({"id": id, "jsonrpc": "2.0", "method": "session/new", "params": params});
     let mut receiver =
         match write_to_session_and_subscribe(&mut manager, &session_id, &request).await {
             Ok(rx) => rx,
@@ -351,17 +343,7 @@ async fn handle_session_sse_response(
 
     let mut manager = state.session_manager.lock().await;
 
-    // Check if session exists before attempting to write
-    if !manager.sessions.contains_key(session_id) {
-        drop(manager);
-        return Ok(HttpResponse::new(404).json(&jsonrpc::error_response(
-            id,
-            -32001,
-            "Session not found",
-        )));
-    }
-
-    let mut receiver = match write_to_session_and_subscribe(&mut manager, session_id, &json).await {
+    let mut receiver = match validate_and_write_to_session(&mut manager, session_id, &json).await {
         Ok(rx) => rx,
         Err(_) => {
             return Ok(HttpResponse::new(404).json(&jsonrpc::error_response(
@@ -374,7 +356,7 @@ async fn handle_session_sse_response(
     drop(manager);
 
     let mut stream = ctx.stream;
-    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n").await?;
+    stream.write_all(SSE_HEADERS.as_bytes()).await?;
     stream.flush().await?;
 
     loop {

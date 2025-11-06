@@ -1,0 +1,39 @@
+{
+  "agent_servers": {
+    "Claude": {
+      "command": "npx",
+      "args": ["@zed-industries/claude-code-acp"],
+      "env": {}
+    },
+    "Codex": {
+      "command": "npx",
+      "args": ["@zed-industries/codex-acp"],
+      "env": {}
+    },
+    "Gemini": {
+      "command": "npx",
+      "args": ["@google/gemini-cli", "--experimental-acp", "--model", "gemini-2.5-pro"],
+      "env": {}
+    },
+    "QwenCode": {
+      "command": "npx",
+      "args": ["@qwen-code/qwen-code", "--experimental-acp"],
+      "env": {}
+    },
+    "Iflow": {
+      "command": "iflow",
+      "args": ["--experimental-acp"],
+      "env": {}
+    },
+    "Kimi": {
+      "command": "kimi",
+      "args": ["--acp"],
+      "env": {}
+    },
+    "OpenCode": {
+      "command": "opencode",
+      "args": ["acp"]
+    }
+  },
+  "upload_dir": "."
+}

@@ -362,13 +362,14 @@ async fn write_http_request(stream: &mut TcpStream, request: &HttpRequest) -> Re
         query_string
     );
     stream.write_all(request_line.as_bytes()).await?;
-
+    stream.flush().await?;
     // Write headers
     for (key, value) in &request.headers {
         stream
             .write_all(format!("{}: {}\r\n", key, value).as_bytes())
             .await?;
     }
+    stream.flush().await?;
 
     // End of headers
     stream.write_all(b"\r\n").await?;

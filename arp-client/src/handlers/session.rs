@@ -332,14 +332,18 @@ async fn handle_session_prompt_sse(
                     false
                 };
 
-                if stream
+                stream
                     .write_all(format!("data: {}\n\n", message).as_bytes())
-                    .await
-                    .is_err()
-                    || stream.flush().await.is_err()
-                {
-                    break;
-                }
+                    .await?;
+                stream.flush().await?;
+                // if stream
+                //     .write_all(format!("data: {}\n\n", message).as_bytes())
+                //     .await
+                //     .is_err()
+                //     || stream.flush().await.is_err()
+                // {
+                //     break;
+                // }
 
                 if is_end {
                     break;

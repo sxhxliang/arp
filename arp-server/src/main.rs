@@ -465,30 +465,45 @@ async fn route_public_connection(
 
     // Phase 2: Try to get connection from pool first (fast path)
     if let Some(mut proxy_stream) = client_info.pool.pop() {
+        // Validate the connection is still alive by checking if it's writable
         // If we parsed HTTP, we need to reconstruct and send the request
         if let Some(request) = http_request.as_ref() {
             // Write reconstructed HTTP request to proxy stream
-            if let Err(e) = write_http_request(&mut proxy_stream, request).await {
-                error!("Failed to write HTTP request to proxy stream: {}", e);
-                return Err(e);
+            match write_http_request(&mut proxy_stream, request).await {
+                Ok(_) => {
+                    // Successfully wrote request, join the streams
+                    if let Err(e) = join_streams(user_stream, proxy_stream).await {
+                        error!("Error joining streams from pool: {}", e);
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to write HTTP request to pooled connection: {}. Connection may be stale, falling back to slow path.",
+                        e
+                    );
+                    // Don't return the bad connection to pool, let it drop
+                    // Fall through to Phase 3 to create a new connection
+                }
             }
+        } else {
+            // No HTTP request to reconstruct, join streams directly
+            if let Err(e) = join_streams(user_stream, proxy_stream).await {
+                error!("Error joining streams from pool: {}", e);
+            }
+            return Ok(());
         }
-
-        // Join the streams directly
-        if let Err(e) = join_streams(user_stream, proxy_stream).await {
-            error!("Error joining streams from pool: {}", e);
-        }
-
-        return Ok(());
     }
 
     // Phase 3: Fallback to traditional proxy request (slow path)
+    // This is also reached if pool connection was stale
     let proxy_conn_id = generate_id();
     let command = Command::RequestNewProxyConn {
         proxy_conn_id: proxy_conn_id.clone(),
     };
 
     // Insert into pending before sending command to avoid race condition
+    let has_http_request = http_request.is_some();
     let pending_conn = PendingConnection {
         stream: user_stream,
         timestamp: std::time::Instant::now(),
@@ -498,7 +513,16 @@ async fn route_public_connection(
 
     // Send command to client via channel
     if client_info.cmd_tx.send(command).is_err() {
-        pending_connections.remove(&proxy_conn_id);
+        // Command send failed - remove pending and notify user
+        if let Some((_, mut pending)) = pending_connections.remove(&proxy_conn_id) {
+            // Send error response to user if possible
+            if has_http_request {
+                let _ = HttpResponse::new(502)
+                    .text("Client connection closed")
+                    .send(&mut pending.stream)
+                    .await;
+            }
+        }
         remove_client_if_current(&active_clients, token.as_str(), &client_info);
         return Err(anyhow!("Client channel closed"));
     }

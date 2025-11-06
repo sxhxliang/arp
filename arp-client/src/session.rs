@@ -178,12 +178,38 @@ impl SessionManager {
     }
 
     /// Update the session ID after receiving response from child
+    /// This handles the transition from temporary session ID to real session ID
     pub async fn update_session_id(&mut self, old_id: &str, new_id: &str) {
+        // Check if old session exists first
+        if !self.sessions.contains_key(old_id) {
+            tracing::warn!("Attempted to update non-existent session: {}", old_id);
+            return;
+        }
+
+        // Check if new_id already exists (should not happen, but be defensive)
+        if self.sessions.contains_key(new_id) && old_id != new_id {
+            tracing::error!(
+                "Cannot update session {} to {} - target ID already exists",
+                old_id,
+                new_id
+            );
+            return;
+        }
+
+        // Remove old entry and update in a single critical section
         if let Some(mut session) = self.sessions.remove(old_id) {
+            // Update all session fields
             session.session_id = new_id.to_string();
             *session.real_session_id.lock().await = Some(new_id.to_string());
             *session.updated_at.lock().await = chrono::Utc::now().to_rfc3339();
+
+            // Insert with new key - this is atomic from HashMap's perspective
             self.sessions.insert(new_id.to_string(), session);
+
+            tracing::info!("Session ID updated: {} -> {}", old_id, new_id);
+        } else {
+            // This should not happen due to the check above, but log it
+            tracing::error!("Session {} disappeared during update", old_id);
         }
     }
 
@@ -221,18 +247,54 @@ impl SessionManager {
     pub async fn close_session(&mut self, session_id: &str, state: Arc<HandlerState>) {
         if let Some(mut session) = self.sessions.remove(session_id) {
             state.log(&format!("Closing session: {}", session_id));
+
+            // Drop stdin to signal EOF to child process
             drop(session.stdin);
+
             let timeout = tokio::time::Duration::from_secs(5);
-            let _ = tokio::time::timeout(timeout, session.stdout_task).await;
-            let _ = tokio::time::timeout(timeout, session.stderr_task).await;
-            let _ = session.child.kill().await;
-            match session.child.wait().await {
-                Ok(status) => state.log(&format!(
+
+            // Wait for stdout/stderr tasks with timeout
+            match tokio::time::timeout(timeout, session.stdout_task).await {
+                Ok(Ok(())) => state.log(&format!("Session {} stdout task completed", session_id)),
+                Ok(Err(e)) => state.log_error(&format!("Session {} stdout task panicked: {:?}", session_id, e)),
+                Err(_) => state.log_error(&format!("Session {} stdout task timeout", session_id)),
+            }
+
+            match tokio::time::timeout(timeout, session.stderr_task).await {
+                Ok(Ok(())) => state.log(&format!("Session {} stderr task completed", session_id)),
+                Ok(Err(e)) => state.log_error(&format!("Session {} stderr task panicked: {:?}", session_id, e)),
+                Err(_) => state.log_error(&format!("Session {} stderr task timeout", session_id)),
+            }
+
+            // Try to kill the child process
+            match session.child.kill().await {
+                Ok(_) => state.log(&format!("Session {} child process killed", session_id)),
+                Err(e) => {
+                    // Process might have already exited
+                    state.log(&format!("Session {} kill returned error (may be already dead): {}", session_id, e));
+                }
+            }
+
+            // Wait for child process with timeout to avoid blocking forever
+            match tokio::time::timeout(timeout, session.child.wait()).await {
+                Ok(Ok(status)) => state.log(&format!(
                     "Session {} exited with code {:?}",
                     session_id,
                     status.code()
                 )),
-                Err(e) => state.log_error(&format!("Failed to wait for child process: {}", e)),
+                Ok(Err(e)) => state.log_error(&format!(
+                    "Session {} wait failed: {}",
+                    session_id, e
+                )),
+                Err(_) => {
+                    state.log_error(&format!(
+                        "Session {} wait timeout - process may be zombie. Consider manual cleanup.",
+                        session_id
+                    ));
+                    // On Unix systems, the process is now a zombie and will be cleaned up
+                    // when the parent process exits. On Windows, this is less of an issue.
+                    // We've done our best to kill it; if it won't die, we log and move on.
+                }
             }
         }
     }

@@ -163,7 +163,7 @@ pub async fn handle_session(ctx: HandlerContext, state: HandlerState) -> Result<
 
     let method = json.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = json.get("id").cloned();
-
+    state.pretty_print_message("[Client HTTP →  Server]", &json.to_string());
     match method {
         "session/new" => handle_session_new(ctx, state, json, id.as_ref()).await,
         "initialize" | "session/set_mode" | "session/set_model" | "session/cancel" => {
@@ -181,7 +181,48 @@ pub async fn handle_session(ctx: HandlerContext, state: HandlerState) -> Result<
             );
             send_json_response(ctx.stream, &response).await
         }
-        _ => send_error(ctx.stream, id.as_ref(), -32602, "Invalid method").await,
+        _ => {
+            handle_session_permission_response(ctx, state, json, id.as_ref()).await
+        },
+    }
+}
+
+async fn handle_session_permission_response(
+    ctx: HandlerContext,
+    state: HandlerState,
+    json: Value,
+    id: Option<&Value>,
+) -> Result<HttpResponse> {
+    let result = match json.get("result") {
+        Some(p) => p,
+        None => return send_error(ctx.stream, id, -32602, "Invalid result").await,
+    };
+
+    let session_id = match jsonrpc::extract_session_id(result) {
+        Some(s) => s,
+        None => return send_error(ctx.stream, id, -32602, "Missing _meta.sessionId").await,
+    };
+
+    let mut manager = state.session_manager.lock().await;
+
+    // Check if session exists before attempting to write
+    if !manager.sessions.contains_key(session_id) {
+        drop(manager);
+        return send_error(ctx.stream, id, -32001, "Session not found").await;
+    }
+
+    let mut receiver = match write_to_session_and_subscribe(&mut manager, session_id, &json).await {
+        Ok(rx) => rx,
+        Err(msg) => return send_error(ctx.stream, id, -32603, msg).await,
+    };
+    drop(manager);
+
+    match wait_for_response(&mut receiver, id).await {
+        Ok(msg) => {
+            state.pretty_print_message("[Server → HTTP Client]", &msg.to_string());
+            send_json_response(ctx.stream, &msg).await
+        }
+        Err(error) => send_json_response(ctx.stream, &error).await,
     }
 }
 
@@ -202,6 +243,12 @@ async fn handle_session_json_response(
     };
 
     let mut manager = state.session_manager.lock().await;
+
+    // Check if session exists before attempting to write
+    if !manager.sessions.contains_key(session_id) {
+        drop(manager);
+        return send_error(ctx.stream, id, -32001, "Session not found").await;
+    }
 
     let mut receiver = match write_to_session_and_subscribe(&mut manager, session_id, &json).await {
         Ok(rx) => rx,
@@ -303,6 +350,17 @@ async fn handle_session_sse_response(
     };
 
     let mut manager = state.session_manager.lock().await;
+
+    // Check if session exists before attempting to write
+    if !manager.sessions.contains_key(session_id) {
+        drop(manager);
+        return Ok(HttpResponse::new(404).json(&jsonrpc::error_response(
+            id,
+            -32001,
+            "Session not found",
+        )));
+    }
+
     let mut receiver = match write_to_session_and_subscribe(&mut manager, session_id, &json).await {
         Ok(rx) => rx,
         Err(_) => {
@@ -336,20 +394,19 @@ async fn handle_session_sse_response(
                     .write_all(format!("data: {}\n\n", message).as_bytes())
                     .await?;
                 stream.flush().await?;
-                // if stream
-                //     .write_all(format!("data: {}\n\n", message).as_bytes())
-                //     .await
-                //     .is_err()
-                //     || stream.flush().await.is_err()
-                // {
-                //     break;
-                // }
 
                 if is_end {
                     break;
                 }
             }
-            Err(_) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                state.log(&format!(
+                    "SSE receiver lagged {} messages for session {}",
+                    skipped, session_id
+                ));
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 

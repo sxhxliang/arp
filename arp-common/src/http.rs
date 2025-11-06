@@ -49,6 +49,9 @@ impl FromStr for HttpMethod {
     }
 }
 
+/// Maximum allowed Content-Length to prevent DoS attacks (100MB)
+const MAX_CONTENT_LENGTH: usize = 100 * 1024 * 1024;
+
 /// Parsed HTTP request
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -124,7 +127,17 @@ impl HttpRequest {
                 let value = value.trim().to_string();
 
                 if key == "content-length" {
-                    content_length = value.parse().unwrap_or(0);
+                    // Validate Content-Length to prevent DoS attacks
+                    content_length = value.parse::<usize>()
+                        .map_err(|_| anyhow!("Invalid Content-Length header: {}", value))?;
+
+                    if content_length > MAX_CONTENT_LENGTH {
+                        return Err(anyhow!(
+                            "Content-Length {} exceeds maximum allowed size of {} bytes",
+                            content_length,
+                            MAX_CONTENT_LENGTH
+                        ));
+                    }
                 }
 
                 headers.insert(key, value);

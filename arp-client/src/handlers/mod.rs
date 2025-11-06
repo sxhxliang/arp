@@ -4,7 +4,6 @@ pub mod session;
 use crate::config::ClientConfig;
 use crate::session::SessionManager;
 use colored::Colorize;
-use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -72,16 +71,16 @@ impl HandlerState {
             println!("{}", dir);
         }
 
-        if self.raw {
-            println!("{}", message);
-        } else if let Ok(json) = serde_json::from_str::<Value>(message) {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json).unwrap_or_else(|_| message.to_string())
-            );
-        } else {
-            println!("{}", message);
-        }
+        // if self.raw {
+        //     println!("{}", message);
+        // } else if let Ok(json) = serde_json::from_str::<Value>(message) {
+        //     println!(
+        //         "{}",
+        //         serde_json::to_string_pretty(&json).unwrap_or_else(|_| message.to_string())
+        //     );
+        // } else {
+        //     println!("{}", message);
+        // }
 
         if self.verbose {
             if !self.raw {

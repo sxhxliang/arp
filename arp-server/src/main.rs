@@ -4,12 +4,13 @@ use common::http::{HttpRequest, HttpResponse};
 use common::{Command, join_streams, read_command, write_command};
 use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, interval, timeout};
 use tracing::{Level, error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -82,6 +83,17 @@ fn remove_client_if_current(
     }
 }
 
+fn is_transient_accept_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+    )
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -149,9 +161,49 @@ fn tune_tcp_socket(stream: &TcpStream) -> Result<()> {
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
 
-        // Enable TCP_QUICKACK on Linux for lower latency
+        // Enable TCP Keep-Alive to detect dead connections
+        let keepalive: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &keepalive as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
         #[cfg(target_os = "linux")]
         {
+            // Start probing after 60 seconds of idle time
+            let keepidle: libc::c_int = 60;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                &keepidle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Send probes every 10 seconds
+            let keepintvl: libc::c_int = 10;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                &keepintvl as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Drop connection after 3 failed probes
+            let keepcnt: libc::c_int = 3;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
+                &keepcnt as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Enable TCP_QUICKACK on Linux for lower latency
             let quickack: libc::c_int = 1;
             libc::setsockopt(
                 fd,
@@ -170,7 +222,14 @@ async fn handle_control_connections(
     active_clients: ActiveClients,
 ) -> Result<()> {
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) if is_transient_accept_error(&err) => {
+                warn!("Transient error accepting control connection: {}", err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         info!("New control connection from: {}", addr);
 
         // Tune TCP socket for control connection
@@ -255,13 +314,30 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients) 
         };
     let client_info_for_reader = Arc::clone(&client_info);
 
-    // Keep reading from the control channel, but we don't expect more commands.
-    // The main purpose is to detect when the client disconnects.
+    // Keep reading from the control channel to detect disconnection.
+    // Use timeout to prevent hanging on dead connections.
+    const IDLE_TIMEOUT_SECS: u64 = 90;
     loop {
-        if reader.read_u8().await.is_err() {
-            warn!("Client {} disconnected.", client_id);
-            remove_client_if_current(&active_clients, &client_id, &client_info_for_reader);
-            break;
+        match timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), reader.read_u8()).await {
+            Ok(Ok(_)) => {
+                // Received data (unexpected but harmless)
+                continue;
+            }
+            Ok(Err(e)) => {
+                // Read error - connection closed
+                warn!("Client {} disconnected: {}", client_id, e);
+                remove_client_if_current(&active_clients, &client_id, &client_info_for_reader);
+                break;
+            }
+            Err(_) => {
+                // Timeout - connection is idle for too long, likely dead
+                warn!(
+                    "Client {} idle timeout ({}s). Assuming connection is dead.",
+                    client_id, IDLE_TIMEOUT_SECS
+                );
+                remove_client_if_current(&active_clients, &client_id, &client_info_for_reader);
+                break;
+            }
         }
     }
 
@@ -274,7 +350,14 @@ async fn handle_proxy_connections(
     active_clients: ActiveClients,
 ) -> Result<()> {
     loop {
-        let (mut proxy_stream, _addr) = listener.accept().await?;
+        let (mut proxy_stream, _addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) if is_transient_accept_error(&err) => {
+                warn!("Transient error accepting proxy connection: {}", err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         // Tune TCP socket for proxy connection (high throughput)
         let _ = tune_tcp_socket(&proxy_stream);
@@ -320,7 +403,14 @@ async fn handle_public_connections(
     pending_connections: PendingConnectionsMap,
 ) -> Result<()> {
     loop {
-        let (user_stream, _addr) = listener.accept().await?;
+        let (user_stream, _addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) if is_transient_accept_error(&err) => {
+                warn!("Transient error accepting public connection: {}", err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         // Tune TCP socket for public connection (low latency critical)
         let _ = tune_tcp_socket(&user_stream);
